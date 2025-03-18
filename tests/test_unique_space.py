@@ -2,7 +2,7 @@ import unittest
 
 import numpy
 
-from cacherl.custom_env.MultiDiscreteUnique import MultiDiscreteUnique
+from cacherl.utils.MultiDiscreteUnique import MultiDiscreteUnique
 
 
 class MultiDiscreteSpaceTestCase(unittest.TestCase):

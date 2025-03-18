@@ -3,10 +3,10 @@ import gymnasium
 import numpy
 from gymnasium import spaces
 from gymnasium.core import ActType, ObsType, RenderFrame
-from cacherl.custom_env.MultiDiscreteUnique import MultiDiscreteUnique
+from cacherl.utils.MultiDiscreteUnique import MultiDiscreteUnique
 from matplotlib import pyplot
 
-class CacheEnv(gymnasium.Env[ObsType: dict[str,dict],ActType: int | dict[str, int]]):
+class CacheEnv(gymnasium.Env):
     """
     Simulates a variable TTL cache. At each step, a single value
      in a mock data store will either be updated or queried, and the agent must decide whether
@@ -14,11 +14,17 @@ class CacheEnv(gymnasium.Env[ObsType: dict[str,dict],ActType: int | dict[str, in
      Cache misses and dirty rows being fetched from the cache will yield negative reward,
       while cache hits will yield positive rewards. The agent is able to observe the cache itself,
      including the current items in the cache, their current TTLs, and whether they are dirty or not.
-
      """
     metadata = {"render_modes": ["human"]}
     def _get_obs(self):
-        return self.state
+        return self._obs
+
+    def _init_state(self):
+        self._obs = self.observation_space.sample()
+        self._state = list(self._obs)
+        for i in range(len(self._state)):
+            self._state[i] = list(self._state[i])
+        self._state[1][2] = numpy.zeros(self.cache_size, dtype=int)
 
     def __init__(self, cache_size=32, store_size=128, max_ttl: int = 50, render_mode: str = "human"):
         """
@@ -42,37 +48,33 @@ class CacheEnv(gymnasium.Env[ObsType: dict[str,dict],ActType: int | dict[str, in
         self.cache_size = int(cache_size)
         self.store_size = int(store_size)
         self.max_ttl = int(max_ttl)
-        cache_space = spaces.Dict({
-         "store_rows":   MultiDiscreteUnique(numpy.array([self.store_size for _ in range(cache_size)]),start=[0 for _ in range(cache_size)]),
-            "current_ttl": spaces.MultiDiscrete(numpy.array([max_ttl for _ in range(cache_size)]), start=[1 for _ in range(cache_size)]),
-            "dirty_bits": spaces.MultiBinary(cache_size)
-        })
-        previous_request_space = spaces.Dict({
-            "get_or_post": spaces.Discrete(2),
-            "store_row": spaces.Discrete(store_size)
-        })
+        cache_space = spaces.Tuple(
+            (MultiDiscreteUnique(numpy.array([self.store_size for _ in range(cache_size)]),start=[0 for _ in range(cache_size)]),
+            spaces.MultiDiscrete(numpy.array([max_ttl for _ in range(cache_size)]), start=[1 for _ in range(cache_size)]),
+            spaces.MultiBinary(cache_size),
+        ))
+        previous_request_space = spaces.Tuple((
+             spaces.Discrete(2),
+             spaces.Discrete(store_size)
+        ))
         request_mask = numpy.random.exponential(scale=1.0, size=self.store_size)
         request_mask = numpy.abs(request_mask)
         request_mask = request_mask / numpy.sum(request_mask)
-        self.request_mask = request_mask
-        self.request_mask = {
-            "store_row": request_mask,
-            "get_or_post": numpy.array([0.5,0.5])
-        }
+        request_mask = tuple((numpy.array([0.5, 0.5]), request_mask))
+        self._request_mask = request_mask
+        self._request_space = previous_request_space
         self.action_space = spaces.OneOf([
-            spaces.Dict({
-                "cache_row": spaces.Discrete(cache_size,start=0),
-                "ttl": spaces.Discrete(max_ttl,start=1)
-            }),
+            spaces.Tuple((
+                spaces.Discrete(cache_size,start=0),
+                spaces.Discrete(max_ttl,start=1)
+        )),
             spaces.Discrete(1,start=-1)
         ])
-
-        self.observation_space: spaces.Dict = spaces.Dict({
-            "previous_request": previous_request_space,
-            "cache": cache_space,
-        })
-        self.state: ObsType = self.observation_space.sample()
-        self.state["cache"]["dirty_bits"] = numpy.zeros(cache_size,dtype=int)
+        self.observation_space: spaces.Tuple = spaces.Tuple((
+            previous_request_space,
+             cache_space,
+        ))
+        self._init_state()
 
     def reset(
         self,
@@ -81,23 +83,20 @@ class CacheEnv(gymnasium.Env[ObsType: dict[str,dict],ActType: int | dict[str, in
         options: dict[str, Any] | None = None,
     ) -> tuple[ObsType, dict[str, Any]]:
         super().reset(seed=seed)
-        self.state = self.observation_space.sample()
-        self.state["cache"]["dirty_bits"] = numpy.zeros(self.cache_size,dtype=int)
-        return self.state, dict()
+        self._init_state()
+        return self._obs, dict()
 
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
-        if action[1] != -1 and("cache_row" not in action[1] or "ttl" not in action[1]):
-            raise ValueError("Action should either be -1 for not caching, or a dictionary from cache_row to ttl.")
-        self.state["previous_request"] = self.observation_space.spaces["previous_request"].sample(probability=self.request_mask)
+        self._state[0] = list(self._request_space.spaces[1].sample(probability=self._request_mask))
         reward = 0.0
-        cached_rows: numpy.ndarray = self.state["cache"]["store_rows"]
-        requested_row = self.state["previous_request"]["store_row"]
-        dirty_bits = self.state["cache"]["dirty_bits"]
-        ttls = self.state["cache"]["current_ttl"]
+        cached_rows: numpy.ndarray = self._state[1][0]
+        requested_row = self._state[0][1]
+        dirty_bits = self._state[1][2]
+        ttls = self._state[1][1]
         if action[1] is dict:
-            if self.state["previous_request"]["get_or_post"] == 0:
+            if self._state[0][0] == 0:
                 row_is_cached = False
                 for i in range(len(cached_rows)):
                     if requested_row == cached_rows[i]:
@@ -130,7 +129,11 @@ class CacheEnv(gymnasium.Env[ObsType: dict[str,dict],ActType: int | dict[str, in
                 ttls[i] -= 1
             if ttls[i] == 0:
                 cached_rows[i] = self.store_size
-        return self.state, reward, False, False, {"hits": self.hits, "misses": self.misses}
+        self._obs = self._state
+        for i in range(len(self._state)):
+            self._obs[i] = tuple(self._state[i])
+        self._obs = tuple(self._obs)
+        return self._obs, reward, False, False, {"hits": self.hits, "misses": self.misses}
 
     def render(self) -> RenderFrame | list[RenderFrame] | None:
         if self.render_mode == "human":
